@@ -77,9 +77,52 @@ class ServiceOrderCreate(BaseModel):
     case_id: int = Field(gt=0)
     service_code: str = Field(min_length=2, max_length=60)
     quantity: int = Field(default=1, ge=1, le=100)
-    unit_price_cents: int = Field(ge=0, le=100_000_000)
+    applicability: dict[str, Any] = Field(default_factory=dict)
     requested_by: str = Field(min_length=2, max_length=80)
     notes: str = Field(default="", max_length=1000)
+
+
+class PriceItemInput(BaseModel):
+    service_code: str = Field(min_length=2, max_length=60)
+    service_name: str = Field(min_length=2, max_length=120)
+    unit: str = Field(default="次", min_length=1, max_length=20)
+    unit_price_cents: int = Field(ge=0, le=100_000_000)
+    applicability: dict[str, Any] = Field(default_factory=dict)
+
+
+class CatalogCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    effective_on: date
+    notes: str = Field(default="", max_length=1000)
+    created_by: str = Field(min_length=2, max_length=80)
+    items: list[PriceItemInput] = Field(min_length=1, max_length=500)
+
+
+class CatalogUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=120)
+    effective_on: date | None = None
+    notes: str | None = Field(default=None, max_length=1000)
+    items: list[PriceItemInput] | None = Field(default=None, max_length=500)
+
+
+class CatalogPublish(BaseModel):
+    published_by: str = Field(min_length=2, max_length=80)
+    effective_on: date | None = None
+
+
+class OrderAdjustmentCreate(BaseModel):
+    kind: str = Field(pattern=r"^(surcharge|refund)$")
+    amount_cents: int = Field(gt=0, le=100_000_000)
+    reason: str = Field(default="", max_length=500)
+    created_by: str = Field(min_length=2, max_length=80)
+    price_catalog_id: int | None = Field(default=None, gt=0)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+
+class QuoteRequest(BaseModel):
+    service_code: str = Field(min_length=2, max_length=60)
+    applicability: dict[str, Any] = Field(default_factory=dict)
+    quantity: int = Field(default=1, ge=1, le=100)
 
 
 class BurialRightCreate(BaseModel):

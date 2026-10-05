@@ -7,6 +7,14 @@ def create_case(client, ref: str = "CASE-001") -> dict:
     return response.json()
 
 
+def publish_catalog(client, items, *, effective_on="2026-10-01", name="价格目录", actor="finance-manager"):
+    created = client.post("/api/mortuary/price-catalogs", json={"name": name, "effective_on": effective_on, "notes": "", "created_by": actor, "items": items})
+    assert created.status_code == 201, created.text
+    published = client.post(f"/api/mortuary/price-catalogs/{created.json()['id']}/publish", json={"published_by": actor})
+    assert published.status_code == 200, published.text
+    return published.json()
+
+
 def test_case_custody_timeline_and_idempotency(client):
     case = create_case(client)
     payload = {"from_location": "接运车辆A", "to_location": "冷藏室C-01", "seal_code": "SEAL-1001", "requested_by": "driver-li", "idempotency_key": "custody-case-001"}
@@ -35,10 +43,14 @@ def test_resource_reservation_and_cancellation(client):
 
 
 def test_orders_invoice_and_payment(client):
+    publish_catalog(client, [
+        {"service_code": "body-care", "service_name": "遗体护理", "unit": "次", "unit_price_cents": 80000, "applicability": {}},
+        {"service_code": "farewell-hall", "service_name": "送别厅服务", "unit": "场", "unit_price_cents": 120000, "applicability": {}},
+    ])
     case = create_case(client, "CASE-F-001")
     order_ids = []
-    for code, quantity, price in (("body-care", 1, 80000), ("farewell-hall", 2, 120000)):
-        order = client.post("/api/mortuary/service-orders", json={"case_id": case["id"], "service_code": code, "quantity": quantity, "unit_price_cents": price, "requested_by": "family-service", "notes": "已与家属核对"})
+    for code, quantity in (("body-care", 1), ("farewell-hall", 2)):
+        order = client.post("/api/mortuary/service-orders", json={"case_id": case["id"], "service_code": code, "quantity": quantity, "requested_by": "family-service", "notes": "已与家属核对"})
         assert order.status_code == 201
         order_ids.append(order.json()["id"])
         assert client.post(f"/api/mortuary/service-orders/{order.json()['id']}/confirm?actor=finance-reviewer").status_code == 200

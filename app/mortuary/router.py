@@ -1,6 +1,22 @@
 from fastapi import APIRouter, Query
 
-from app.mortuary.schemas import BurialRightCreate, BurialRightRenew, CaseCreate, CustodyAccept, CustodyTransferCreate, InvoiceCreate, PaymentCreate, ReservationCreate, ResourceCreate, ServiceOrderCreate
+from app.mortuary.schemas import (
+    BurialRightCreate,
+    BurialRightRenew,
+    CaseCreate,
+    CatalogCreate,
+    CatalogPublish,
+    CatalogUpdate,
+    CustodyAccept,
+    CustodyTransferCreate,
+    InvoiceCreate,
+    OrderAdjustmentCreate,
+    PaymentCreate,
+    QuoteRequest,
+    ReservationCreate,
+    ResourceCreate,
+    ServiceOrderCreate,
+)
 from app.mortuary.service import MortuaryService
 
 router = APIRouter(prefix="/api/mortuary", tags=["mortuary"])
@@ -45,9 +61,57 @@ def cancel(reservation_id: int, actor: str = Query(min_length=2), reason: str = 
 def order(payload: ServiceOrderCreate) -> dict:
     return MortuaryService().add_order(payload.model_dump())
 
+@router.post("/service-orders/quote")
+def quote_order(payload: QuoteRequest) -> dict:
+    return MortuaryService().quote_order(payload.model_dump())
+
+@router.get("/service-orders/{order_id}")
+def get_order(order_id: int) -> dict:
+    return MortuaryService().get_order(order_id)
+
 @router.post("/service-orders/{order_id}/confirm")
 def confirm_order(order_id: int, actor: str = Query(min_length=2, max_length=80)) -> dict:
     return MortuaryService().confirm_order(order_id, actor)
+
+@router.post("/service-orders/{order_id}/adjustments")
+def adjust_order(order_id: int, payload: OrderAdjustmentCreate) -> dict:
+    return MortuaryService().create_adjustment(order_id, payload.model_dump())
+
+@router.post("/price-catalogs", status_code=201)
+def create_catalog(payload: CatalogCreate) -> dict:
+    return MortuaryService().create_catalog(payload.model_dump())
+
+@router.get("/price-catalogs")
+def list_catalogs() -> list[dict]:
+    return MortuaryService().list_catalogs()
+
+@router.get("/price-catalogs/effective")
+def effective_catalog() -> dict:
+    return MortuaryService().effective_catalog()
+
+@router.get("/price-catalogs/{catalog_id}")
+def get_catalog(catalog_id: int) -> dict:
+    return MortuaryService().get_catalog(catalog_id)
+
+@router.patch("/price-catalogs/{catalog_id}")
+def update_catalog(catalog_id: int, payload: CatalogUpdate, actor: str = Query(min_length=2, max_length=80)) -> dict:
+    return MortuaryService().update_catalog(catalog_id, payload.model_dump(exclude_unset=True), actor)
+
+@router.post("/price-catalogs/{catalog_id}/publish")
+def publish_catalog(catalog_id: int, payload: CatalogPublish) -> dict:
+    return MortuaryService().publish_catalog(catalog_id, payload.model_dump())
+
+@router.post("/price-catalogs/{catalog_id}/retire")
+def retire_catalog(catalog_id: int, actor: str = Query(min_length=2, max_length=80)) -> dict:
+    return MortuaryService().retire_catalog(catalog_id, actor)
+
+@router.post("/price-catalogs/{catalog_id}/items/{item_id}/discontinue")
+def discontinue_item(catalog_id: int, item_id: int, actor: str = Query(min_length=2, max_length=80)) -> dict:
+    return MortuaryService().discontinue_item(catalog_id, item_id, actor)
+
+@router.get("/price-catalogs/diff/{from_version}/{to_version}")
+def diff_catalogs(from_version: int, to_version: int) -> dict:
+    return MortuaryService().diff_catalogs(from_version, to_version)
 
 @router.post("/burial-rights", status_code=201)
 def create_right(payload: BurialRightCreate, actor: str = Query(min_length=2, max_length=80)) -> dict:
