@@ -53,7 +53,9 @@ class MortuaryService:
             raise NotFoundError("逝者业务档案不存在")
         case["custody_transfers"] = [dict(row) for row in self.connection.execute("SELECT * FROM custody_transfers WHERE case_id=? ORDER BY id", (case_id,)).fetchall()]
         case["reservations"] = [dict(row) for row in self.connection.execute("SELECT r.*,f.code resource_code,f.kind resource_kind FROM facility_reservations r JOIN facility_resources f ON f.id=r.resource_id WHERE r.case_id=? ORDER BY r.start_at", (case_id,)).fetchall()]
-        case["service_orders"] = [dict(row) for row in self.connection.execute("SELECT * FROM funeral_service_orders WHERE case_id=? ORDER BY id", (case_id,)).fetchall()]
+        case["service_orders"] = [self._decorate_order(dict(row), self.repository) for row in self.connection.execute("SELECT * FROM funeral_service_orders WHERE case_id=? ORDER BY id", (case_id,)).fetchall()]
+        for order in case["service_orders"]:
+            order["adjustments"] = self.repository.order_adjustments(order["id"])
         case["timeline"] = self.repository.timeline("case", case_id)
         return case
 
@@ -152,16 +154,167 @@ class MortuaryService:
             repo.event("case", reservation["case_id"], "reservation.cancelled", actor, {"reservation_id": reservation_id, "reason": reason}, now)
             return repo.reservation(reservation_id) or {}
 
+    # ------------------------------------------------------------------
+    # 价格目录版本
+    # ------------------------------------------------------------------
+    def create_catalog(self, payload: dict[str, Any]) -> dict[str, Any]:
+        now = self.now()
+        items = payload["items"]
+        with transaction(immediate=True) as connection:
+            repo = MortuaryRepository(connection)
+            if repo.catalog_label(payload["label"]):
+                raise ConflictError("价格目录版本号已存在")
+            cursor = connection.execute(
+                "INSERT INTO price_catalogs(label,status,notes,effective_from,published_at,published_by,created_by,created_at,updated_at) VALUES(?, 'draft', '', NULL, NULL, '', ?, ?, ?)",
+                (payload["label"], payload["created_by"], now, now),
+            )
+            catalog_id = int(cursor.lastrowid)
+            if payload.get("notes"):
+                connection.execute("UPDATE price_catalogs SET notes=? WHERE id=?", (payload["notes"], catalog_id))
+            repo.replace_items(catalog_id, items, now)
+            catalog = repo.catalog(catalog_id) or {}
+            catalog["items"] = repo.catalog_items(catalog_id)
+            repo.event("price_catalog", catalog_id, "price_catalog.created", payload["created_by"], {"label": payload["label"], "item_count": len(items)}, now)
+            return catalog
+
+    def update_catalog(self, catalog_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        now = self.now()
+        with transaction(immediate=True) as connection:
+            repo = MortuaryRepository(connection)
+            catalog = repo.catalog(catalog_id)
+            if catalog is None:
+                raise NotFoundError("价格目录版本不存在")
+            if catalog["status"] != "draft":
+                raise ConflictError("已发布的价格目录不能原地修改，请新建版本")
+            if payload.get("notes") is not None:
+                connection.execute("UPDATE price_catalogs SET notes=?,updated_at=? WHERE id=?", (payload["notes"], now, catalog_id))
+            if payload.get("items") is not None:
+                repo.replace_items(catalog_id, payload["items"], now)
+            catalog = repo.catalog(catalog_id) or {}
+            catalog["items"] = repo.catalog_items(catalog_id)
+            return catalog
+
+    def get_catalog(self, catalog_id: int) -> dict[str, Any]:
+        catalog = self.repository.catalog(catalog_id)
+        if catalog is None:
+            raise NotFoundError("价格目录版本不存在")
+        catalog["items"] = self.repository.catalog_items(catalog_id)
+        return catalog
+
+    def list_catalogs(self, status: str | None = None) -> list[dict[str, Any]]:
+        return self.repository.catalogs(status)
+
+    def current_pricing(self) -> dict[str, Any]:
+        """当前下单所依据的价格目录；未来生效版本不会提前出现。"""
+        at = self.now()
+        catalog = self.repository.effective_catalog(at)
+        if catalog is None:
+            return {"at": at, "catalog": None, "items": []}
+        catalog["items"] = self.repository.catalog_items(catalog["id"])
+        return {"at": at, "catalog": catalog, "items": [item for item in catalog["items"] if item["active"]]}
+
+    def publish_catalog(self, catalog_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        now = self.now()
+        effective_from = to_storage(payload["effective_from"])
+        with transaction(immediate=True) as connection:
+            repo = MortuaryRepository(connection)
+            catalog = repo.catalog(catalog_id)
+            if catalog is None:
+                raise NotFoundError("价格目录版本不存在")
+            if catalog["status"] == "published":
+                raise ConflictError("价格目录已发布，不能重复发布或原地覆盖")
+            items = repo.catalog_items(catalog_id)
+            if not items:
+                raise ValidationError("空目录不能发布")
+            if not any(item["active"] for item in items):
+                raise ValidationError("目录至少需要保留一个启用项目")
+            # 生效时间必须严格晚于最近一版：保证任意时刻只有一个有效版本，且版本链可追溯。
+            latest = repo.latest_published()
+            if latest is not None and effective_from <= (latest["effective_from"] or ""):
+                raise ConflictError("新版本生效时间必须晚于最近已发布版本", context={"latest_effective_from": latest["effective_from"]})
+            try:
+                connection.execute(
+                    "UPDATE price_catalogs SET status='published',effective_from=?,published_at=?,published_by=?,updated_at=? WHERE id=? AND status='draft'",
+                    (effective_from, now, payload["published_by"], now, catalog_id),
+                )
+            except sqlite3.IntegrityError:  # 并发发布撞上同一生效时间
+                raise ConflictError("该生效时间已有有效价格目录，同一时刻只能存在一个有效版本")
+            catalog = repo.catalog(catalog_id) or {}
+            catalog["items"] = items
+            repo.event("price_catalog", catalog_id, "price_catalog.published", payload["published_by"], {"effective_from": effective_from, "item_count": len(items)}, now)
+            return catalog
+
+    def diff_catalogs(self, base_id: int, target_id: int) -> dict[str, Any]:
+        base = self.repository.catalog(base_id)
+        target = self.repository.catalog(target_id)
+        if base is None or target is None:
+            raise NotFoundError("待比较的价格目录版本不存在")
+        base_items = {item["service_code"]: item for item in self.repository.catalog_items(base_id)}
+        target_items = {item["service_code"]: item for item in self.repository.catalog_items(target_id)}
+        added, removed, changed = [], [], []
+        for code in sorted(set(base_items) | set(target_items)):
+            before, after = base_items.get(code), target_items.get(code)
+            if before is None:
+                added.append({"service_code": code, "service_name": after["service_name"], "unit_price_cents": after["unit_price_cents"], "active": after["active"]})
+            elif after is None:
+                removed.append({"service_code": code, "service_name": before["service_name"], "unit_price_cents": before["unit_price_cents"], "active": before["active"]})
+            else:
+                entry: dict[str, Any] = {"service_code": code, "before": before, "after": after}
+                if before["unit_price_cents"] != after["unit_price_cents"]:
+                    entry["price_delta_cents"] = after["unit_price_cents"] - before["unit_price_cents"]
+                if before["conditions"] != after["conditions"]:
+                    entry["conditions_changed"] = True
+                if before["service_name"] != after["service_name"] or before["unit"] != after["unit"]:
+                    entry["description_changed"] = True
+                if before["active"] != after["active"]:
+                    entry["active_changed"] = {"before": before["active"], "after": after["active"]}
+                if len(entry) > 2:
+                    changed.append(entry)
+        return {
+            "base_catalog": {"id": base["id"], "label": base["label"], "status": base["status"], "effective_from": base["effective_from"]},
+            "target_catalog": {"id": target["id"], "label": target["label"], "status": target["status"], "effective_from": target["effective_from"]},
+            "added": added,
+            "removed": removed,
+            "changed": changed,
+        }
+
+    # ------------------------------------------------------------------
+    # 服务订单：按下单时有效目录冻结价格
+    # ------------------------------------------------------------------
     def add_order(self, payload: dict[str, Any]) -> dict[str, Any]:
         now = self.now()
-        amount = payload["quantity"] * payload["unit_price_cents"]
         with transaction(immediate=True) as connection:
             repo = MortuaryRepository(connection)
             if repo.case(payload["case_id"]) is None:
                 raise NotFoundError("逝者业务档案不存在")
-            cursor = connection.execute("INSERT INTO funeral_service_orders(case_id,service_code,quantity,unit_price_cents,amount_cents,requested_by,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (payload["case_id"], payload["service_code"], payload["quantity"], payload["unit_price_cents"], amount, payload["requested_by"], payload["notes"], now, now))
+            manual_price = payload.get("unit_price_cents")
+            if manual_price is None:
+                catalog = repo.effective_catalog(now)
+                if catalog is None:
+                    raise ConflictError("当前没有已生效的价格目录，无法自动计价")
+                price_item = repo.catalog_item(catalog["id"], payload["service_code"])
+                if price_item is None or not price_item["active"]:
+                    raise NotFoundError("当前有效价格目录中不存在该服务项目或项目已停用")
+                unit_price = int(price_item["unit_price_cents"])
+                pricing = "catalog"
+                catalog_id: int | None = catalog["id"]
+                # 草稿只记录取价来源；项目/单价/条件的正式冻结发生在确认时。
+                item_id: int | None = price_item["id"]
+            else:
+                unit_price = int(manual_price)
+                pricing = "manual"
+                catalog_id = None
+                item_id = None
+            amount = payload["quantity"] * unit_price
+            cursor = connection.execute(
+                "INSERT INTO funeral_service_orders(case_id,service_code,quantity,unit_price_cents,amount_cents,status,requested_by,notes,price_catalog_id,price_item_id,pricing_mode,created_at,updated_at) VALUES(?,?,?,?,?, 'draft', ?,?,?,?,?,?,?)",
+                (payload["case_id"], payload["service_code"], payload["quantity"], unit_price, amount, payload["requested_by"], payload["notes"], catalog_id, item_id, pricing, now, now),
+            )
             order = repo.order(int(cursor.lastrowid)) or {}
-            repo.event("case", payload["case_id"], "service_order.created", payload["requested_by"], {"order_id": order["id"], "service_code": payload["service_code"], "amount_cents": amount}, now)
+            event_payload = {"order_id": order["id"], "service_code": payload["service_code"], "amount_cents": amount, "pricing_mode": pricing}
+            if catalog_id is not None:
+                event_payload["price_catalog_id"] = catalog_id
+            repo.event("case", payload["case_id"], "service_order.created", payload["requested_by"], event_payload, now)
             return order
 
     def confirm_order(self, order_id: int, actor: str) -> dict[str, Any]:
@@ -172,12 +325,116 @@ class MortuaryService:
             if order is None:
                 raise NotFoundError("服务订单不存在")
             if order["status"] == "confirmed":
-                return order
+                return self._order_with_pricing(order_id, repo)
             if order["status"] != "draft":
                 raise ConflictError("当前订单状态不能确认")
-            connection.execute("UPDATE funeral_service_orders SET status='confirmed',updated_at=? WHERE id=?", (now, order_id))
-            repo.event("case", order["case_id"], "service_order.confirmed", actor, {"order_id": order_id}, now)
-            return repo.order(order_id) or {}
+            frozen: dict[str, Any]
+            if order["pricing_mode"] == "catalog":
+                # 确认时以当时有效目录为准冻结项目、单价、适用条件与目录版本；
+                # 未来生效的版本此前不影响下单，此刻若已生效则按新版本冻结。
+                catalog = repo.effective_catalog(now)
+                if catalog is None:
+                    raise ConflictError("当前没有已生效的价格目录，无法确认订单")
+                price_item = repo.catalog_item(catalog["id"], order["service_code"])
+                if price_item is None or not price_item["active"]:
+                    raise ConflictError("该服务项目在当前有效价格目录中已停用，无法确认订单", context={"service_code": order["service_code"], "price_catalog_id": catalog["id"]})
+                amount = int(order["quantity"]) * int(price_item["unit_price_cents"])
+                frozen = {
+                    "price_catalog_id": catalog["id"],
+                    "price_item_id": price_item["id"],
+                    "unit_price_cents": price_item["unit_price_cents"],
+                    "service_name": price_item["service_name"],
+                    "unit": price_item["unit"],
+                    "conditions": price_item["conditions"],
+                    "amount_cents": amount,
+                    "basis": "catalog",
+                }
+                connection.execute(
+                    "UPDATE funeral_service_orders SET unit_price_cents=?,amount_cents=?,price_catalog_id=?,price_item_id=?,frozen_service_name=?,frozen_unit=?,frozen_conditions_json=?,frozen_at=?,updated_at=? WHERE id=?",
+                    (price_item["unit_price_cents"], amount, catalog["id"], price_item["id"], price_item["service_name"], price_item["unit"], json.dumps(price_item["conditions"], ensure_ascii=False, sort_keys=True), now, now, order_id),
+                )
+            else:
+                frozen = {
+                    "price_catalog_id": None,
+                    "price_item_id": None,
+                    "unit_price_cents": order["unit_price_cents"],
+                    "service_name": order["service_code"],
+                    "unit": "项",
+                    "conditions": {},
+                    "amount_cents": int(order["amount_cents"]),
+                    "basis": "manual",
+                }
+                connection.execute(
+                    "UPDATE funeral_service_orders SET frozen_service_name=?,frozen_unit=?,frozen_conditions_json=?,frozen_at=?,updated_at=? WHERE id=?",
+                    (order["service_code"], "项", "{}", now, now, order_id),
+                )
+            connection.execute("UPDATE funeral_service_orders SET status='confirmed' WHERE id=?", (order_id,))
+            repo.event(
+                "case", order["case_id"], "service_order.confirmed", actor,
+                {"order_id": order_id, "price_catalog_id": frozen["price_catalog_id"], "unit_price_cents": frozen["unit_price_cents"], "frozen_at": now},
+                now,
+            )
+            return self._order_with_pricing(order_id, repo)
+
+    @staticmethod
+    def _decorate_order(row: dict[str, Any], repo: MortuaryRepository) -> dict[str, Any]:
+        order = dict(row)
+        order["frozen_conditions"] = json.loads(order.pop("frozen_conditions_json") or "{}")
+        catalog = None
+        if order["price_catalog_id"]:
+            catalog = repo.catalog(order["price_catalog_id"])
+        order["price_catalog"] = None if catalog is None else {
+            "id": catalog["id"], "label": catalog["label"], "status": catalog["status"], "effective_from": catalog["effective_from"],
+        }
+        order["price_basis"] = {
+            "service_code": order["service_code"],
+            "service_name": order.get("frozen_service_name") or "",
+            "unit": order.get("frozen_unit") or "项",
+            "unit_price_cents": order["unit_price_cents"],
+            "conditions": order["frozen_conditions"],
+            "catalog_id": order["price_catalog_id"],
+            "catalog_label": None if catalog is None else catalog["label"],
+            "catalog_effective_from": None if catalog is None else catalog["effective_from"],
+            "frozen_at": order.get("frozen_at"),
+            "basis": order["pricing_mode"],
+        }
+        return order
+
+    def _order_with_pricing(self, order_id: int, repo: MortuaryRepository) -> dict[str, Any]:
+        order = repo.order(order_id)
+        if order is None:
+            raise NotFoundError("服务订单不存在")
+        result = self._decorate_order(order, repo)
+        result["adjustments"] = repo.order_adjustments(order_id)
+        return result
+
+    def get_order(self, order_id: int) -> dict[str, Any]:
+        return self._order_with_pricing(order_id, self.repository)
+
+    def create_order_adjustment(self, order_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        """退款/补差只追加调整记录并关联原订单，原订单的冻结金额永不改写。"""
+        now = self.now()
+        with transaction(immediate=True) as connection:
+            repo = MortuaryRepository(connection)
+            order = repo.order(order_id)
+            if order is None:
+                raise NotFoundError("服务订单不存在")
+            if order["status"] not in {"confirmed", "invoiced"}:
+                raise ConflictError("只有已确认订单可以登记退款或补差")
+            if repo.adjustment_reference(payload["reference"]):
+                raise ConflictError("调整凭证号已存在")
+            connection.execute(
+                "INSERT INTO service_order_adjustments(order_id,kind,amount_cents,reason,reference,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                (order_id, payload["kind"], payload["amount_cents"], payload["reason"], payload["reference"], payload["created_by"], now),
+            )
+            adjustment = repo.adjustment_reference(payload["reference"]) or {}
+            repo.event(
+                "case", order["case_id"], f"service_order.{payload['kind']}", payload["created_by"],
+                {"order_id": order_id, "amount_cents": payload["amount_cents"], "reference": payload["reference"], "reason": payload["reason"]},
+                now,
+            )
+            return {"order": self._order_with_pricing(order_id, repo), "adjustment": adjustment}
+
 
     def create_right(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
         now = self.now()
@@ -243,7 +500,10 @@ class MortuaryService:
                 if duplicate["invoice_id"] != invoice_id or duplicate["amount_cents"] != payload["amount_cents"]:
                     raise ConflictError("支付流水号已用于其他款项")
                 return self.get_invoice(invoice_id, repo)
-            remaining = int(invoice["amount_cents"]) - int(invoice["paid_cents"])
+            adjustments = repo.invoice_adjustments(invoice_id)
+            refund_total = sum(int(row["amount_cents"]) for row in adjustments if row["kind"] == "refund")
+            surcharge_total = sum(int(row["amount_cents"]) for row in adjustments if row["kind"] == "surcharge")
+            remaining = int(invoice["amount_cents"]) + surcharge_total - refund_total - int(invoice["paid_cents"])
             if payload["amount_cents"] > remaining:
                 raise ValidationError("支付金额超过账单未付余额")
             connection.execute("INSERT INTO payments(invoice_id,amount_cents,channel,external_reference,received_by,received_at) VALUES(?,?,?,?,?,?)", (invoice_id, payload["amount_cents"], payload["channel"], payload["external_reference"], payload["received_by"], now))
@@ -258,7 +518,29 @@ class MortuaryService:
         invoice = repo.invoice(invoice_id)
         if invoice is None:
             raise NotFoundError("账单不存在")
-        invoice["items"] = [dict(row) for row in repo.connection.execute("SELECT * FROM invoice_items WHERE invoice_id=? ORDER BY order_id", (invoice_id,)).fetchall()]
+        invoice["items"] = []
+        for row in repo.connection.execute("SELECT ii.*,o.service_code,o.quantity,o.unit_price_cents,o.price_catalog_id,o.frozen_service_name,o.frozen_unit,o.frozen_conditions_json,o.frozen_at,o.pricing_mode FROM invoice_items ii JOIN funeral_service_orders o ON o.id=ii.order_id WHERE ii.invoice_id=? ORDER BY ii.order_id", (invoice_id,)).fetchall():
+            line = dict(row)
+            line["frozen_conditions"] = json.loads(line.pop("frozen_conditions_json") or "{}")
+            catalog = repo.catalog(line["price_catalog_id"]) if line["price_catalog_id"] else None
+            line["price_basis"] = {
+                "service_code": line["service_code"],
+                "service_name": line.get("frozen_service_name") or "",
+                "unit": line.get("frozen_unit") or "项",
+                "unit_price_cents": line["unit_price_cents"],
+                "catalog_id": line["price_catalog_id"],
+                "catalog_label": None if catalog is None else catalog["label"],
+                "catalog_effective_from": None if catalog is None else catalog["effective_from"],
+                "conditions": line["frozen_conditions"],
+                "frozen_at": line.get("frozen_at"),
+                "basis": line["pricing_mode"],
+            }
+            invoice["items"].append(line)
         invoice["payments"] = [dict(row) for row in repo.connection.execute("SELECT * FROM payments WHERE invoice_id=? ORDER BY id", (invoice_id,)).fetchall()]
-        invoice["remaining_cents"] = int(invoice["amount_cents"]) - int(invoice["paid_cents"])
+        invoice["adjustments"] = repo.invoice_adjustments(invoice_id)
+        refund_total = sum(int(row["amount_cents"]) for row in invoice["adjustments"] if row["kind"] == "refund")
+        surcharge_total = sum(int(row["amount_cents"]) for row in invoice["adjustments"] if row["kind"] == "surcharge")
+        invoice["refund_cents"] = refund_total
+        invoice["surcharge_cents"] = surcharge_total
+        invoice["remaining_cents"] = int(invoice["amount_cents"]) - int(invoice["paid_cents"]) - refund_total + surcharge_total
         return invoice

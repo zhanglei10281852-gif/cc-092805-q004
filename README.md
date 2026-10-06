@@ -14,7 +14,7 @@
 
 ## 初始化与启动
 
-先执行 python -m app.cli init-db 和 python -m app.cli check-db，再用 uvicorn app.main:app --host 0.0.0.0 --port 8432 启动。健康检查为 GET /api/system/health。殡葬业务接口位于 /api/mortuary，涵盖档案、交接、资源、预约、服务订单、墓位权属、账单和时间线。
+先执行 python -m app.cli init-db 和 python -m app.cli check-db，再用 uvicorn app.main:app --host 0.0.0.0 --port 8432 启动。健康检查为 GET /api/system/health。殡葬业务接口位于 /api/mortuary，涵盖档案、交接、资源、预约、价格目录、服务订单、墓位权属、账单和时间线。
 
 ## 测试与编译检查
 
@@ -33,6 +33,12 @@ API 与 CLI 冒烟命令：python -m app.cli smoke、python -m app.cli mortuary-
 - app/services：会话、权限、后台任务及维护服务
 - tests：领域、接口、异常路径和身份回归测试
 
+## 价格目录版本
+
+- `POST/GET /api/mortuary/price-catalogs`：建立草稿版本（含服务项目、单价、适用条件）或列出全部版本；`GET /price-catalogs/current` 返回下单时刻有效的版本；`PATCH /price-catalogs/{id}` 仅草稿可用；`POST /price-catalogs/{id}/publish` 指定生效时间发布；`POST /price-catalogs/diff` 比较任意两版的新增、移除、价格与条件差异。
+- 服务订单不传 `unit_price_cents` 时自动按当前有效目录取价；确认（`POST /service-orders/{id}/confirm`）时冻结项目名称、单价、适用条件、目录版本与冻结时间。
+- `POST /service-orders/{id}/adjustments` 登记退款（refund）或补差（surcharge），凭证号去重；原订单冻结金额不改写。账单明细中的 `price_basis` 可回溯到订单确认时有效的目录行。
+
 ## 一致性约定
 
-SQLite 连接启用外键、WAL、忙等待和即时事务。业务档案采用外部编号去重，保管交接与预约保留幂等键，服务订单开票后不可再次开票，支付流水不能重复分配。关键状态变化同时写入领域时间线；会话令牌仅保存摘要，审计记录不会保存明文密码或令牌。
+SQLite 连接启用外键、WAL、忙等待和即时事务。业务档案采用外部编号去重，保管交接与预约保留幂等键，服务订单开票后不可再次开票，支付流水不能重复分配。价格目录以版本管理：草稿可改、发布后不可原地覆盖，同一时刻只有一个有效版本，未来生效版本不会提前影响下单；服务订单确认时冻结项目、单价、适用条件与目录版本，退款和补差只追加调整记录关联原订单，账单明细可追溯到当时有效的价格依据。关键状态变化同时写入领域时间线；会话令牌仅保存摘要，审计记录不会保存明文密码或令牌。

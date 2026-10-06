@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -73,13 +73,68 @@ class ReservationCreate(BaseModel):
         return self
 
 
+class PriceItemInput(BaseModel):
+    service_code: str = Field(min_length=2, max_length=60)
+    service_name: str = Field(min_length=2, max_length=120)
+    unit: str = Field(default="项", min_length=1, max_length=20)
+    unit_price_cents: int = Field(ge=0, le=100_000_000)
+    conditions: dict[str, Any] = Field(default_factory=dict)
+    active: bool = True
+
+
+class PriceCatalogCreate(BaseModel):
+    label: str = Field(min_length=2, max_length=80, pattern=r"^[A-Za-z0-9._-]+$")
+    notes: str = Field(default="", max_length=1000)
+    created_by: str = Field(min_length=2, max_length=80)
+    items: list[PriceItemInput] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def items_must_be_unique(self):
+        codes = [item.service_code for item in self.items]
+        if len(codes) != len(set(codes)):
+            raise ValueError("目录内服务项目编码不能重复")
+        return self
+
+
+class PriceCatalogUpdate(BaseModel):
+    notes: str | None = Field(default=None, max_length=1000)
+    items: list[PriceItemInput] | None = Field(default=None)
+
+    @model_validator(mode="after")
+    def items_must_be_unique(self):
+        if self.items is not None:
+            codes = [item.service_code for item in self.items]
+            if len(codes) != len(set(codes)):
+                raise ValueError("目录内服务项目编码不能重复")
+        return self
+
+
+class PriceCatalogPublish(BaseModel):
+    effective_from: datetime
+    published_by: str = Field(min_length=2, max_length=80)
+
+
 class ServiceOrderCreate(BaseModel):
     case_id: int = Field(gt=0)
     service_code: str = Field(min_length=2, max_length=60)
     quantity: int = Field(default=1, ge=1, le=100)
-    unit_price_cents: int = Field(ge=0, le=100_000_000)
+    # 兼容旧调用：不传单价则按当前有效价格目录取价；显式传入仅用于目录体系上线前的历史接口。
+    unit_price_cents: int | None = Field(default=None, ge=0, le=100_000_000)
     requested_by: str = Field(min_length=2, max_length=80)
     notes: str = Field(default="", max_length=1000)
+
+
+class ServiceOrderAdjustmentCreate(BaseModel):
+    kind: Literal["refund", "surcharge"]
+    amount_cents: int = Field(gt=0, le=100_000_000)
+    reason: str = Field(min_length=2, max_length=500)
+    reference: str = Field(min_length=4, max_length=120)
+    created_by: str = Field(min_length=2, max_length=80)
+
+
+class PriceCatalogDiffRequest(BaseModel):
+    base_catalog_id: int = Field(gt=0)
+    target_catalog_id: int = Field(gt=0)
 
 
 class BurialRightCreate(BaseModel):
